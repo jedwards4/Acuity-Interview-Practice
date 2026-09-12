@@ -830,7 +830,7 @@
     kokoroLoadBtn.disabled = true;
     kokoroHint.textContent = 'Loading voice model… this can take 10–20 seconds the first time.';
     try{
-      const { KokoroTTS } = await import('https://esm.sh/kokoro-js');
+      const { KokoroTTS } = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
       const device = (navigator.gpu && !kokoroForceWasm.checked) ? 'webgpu' : 'wasm';
       // Kokoro's own docs warn that pairing WebGPU with the 8-bit quantized
       // model produces garbled/distorted audio — fp32 is required on WebGPU.
@@ -879,6 +879,23 @@
     if(!tts) throw new Error('Kokoro model isn\'t loaded');
     const voiceId = kokoroVoiceSelect.value || 'af_heart';
     const audio = await tts.generate(text, { voice: voiceId });
+
+    // Diagnostic logging — safe to leave in, only visible in the console.
+    console.log('[Kokoro debug] raw output object:', audio);
+    console.log('[Kokoro debug] has toBlob():', typeof audio.toBlob === 'function');
+    console.log('[Kokoro debug] has toWav():', typeof audio.toWav === 'function');
+    console.log('[Kokoro debug] sampling_rate:', audio.sampling_rate);
+    console.log('[Kokoro debug] audio field type:', audio.audio ? audio.audio.constructor.name : typeof audio.audio);
+    console.log('[Kokoro debug] audio length (samples):', audio.audio ? audio.audio.length : 'n/a');
+    if(audio.audio && audio.audio.length){
+      let min = Infinity, max = -Infinity;
+      for(let i=0;i<audio.audio.length;i++){
+        if(audio.audio[i] < min) min = audio.audio[i];
+        if(audio.audio[i] > max) max = audio.audio[i];
+      }
+      console.log('[Kokoro debug] sample value range: min=' + min + ' max=' + max);
+    }
+
     if(typeof audio.toBlob === 'function') return audio.toBlob();
     return encodeWav(audio.audio, audio.sampling_rate);
   }
