@@ -613,8 +613,10 @@
   let setupMicStream = null;
   let setupRecorder = null;
   let setupRecordingIndex = null;
-  let kokoroTTS = null;
+  let kokoroTTS = null; // boolean-ish readiness flag — the actual model lives inside the worker
   let kokoroLoading = false;
+  let kokoroWorker = null;
+  let kokoroPending = null; // { resolve, reject } for whichever worker request is in flight
 
   const screens = {
     setup: document.getElementById('screen-setup'),
@@ -651,7 +653,6 @@
   const kokoroVoiceSelect = document.getElementById('kokoroVoiceSelect');
   const kokoroPreviewBtn = document.getElementById('kokoroPreviewBtn');
   const kokoroHint = document.getElementById('kokoroHint');
-  let kokoroForceWasmFlag = false; // set automatically when WebGPU output is detected as corrupted
   const voiceSelect = document.getElementById('voiceSelect');
   const previewVoiceBtn = document.getElementById('previewVoiceBtn');
   const voiceHint = document.getElementById('voiceHint');
@@ -836,22 +837,122 @@
   modeKokoro.addEventListener('change', () => { narrationMode = 'kokoro'; resetNarrationArtifacts(); applyNarrationModeUI(); });
 
   // ---- Kokoro (local, in-browser neural TTS) ----
-  // Runs 100% client-side via kokoro-js (Kokoro-82M model), no account or key needed.
-  async function loadKokoroModel(){
-    if(kokoroTTS) return kokoroTTS;
-    if(kokoroLoading) return null;
-    kokoroLoading = true;
-    kokoroLoadBtn.disabled = true;
-    kokoroHint.textContent = 'Loading voice model… this can take 10–20 seconds the first time.';
-    try{
+  // Runs 100% client-side via kokoro-js (Kokoro-82M model), no account or key
+  // needed. Generation runs inside a Web Worker (a background thread) rather
+  // than on the main thread — WASM inference blocks whatever thread it runs
+  // on, and doing that on the main thread is what made the page look frozen
+  // ("Page Unresponsive") during the six-question pre-generation step.
+  const KOKORO_WORKER_SOURCE = `
+    let tts = null;
+    let forceWasm = false;
+
+    function isSaneAudio(samples){
+      // Valid PCM audio should stay roughly within [-1, 1]. Wildly out-of-range
+      // values (seen in practice: into the tens) mean the execution backend
+      // produced numerically corrupted output, not just a rough-sounding voice.
+      for(let i=0;i<samples.length;i++){
+        if(Math.abs(samples[i]) > 2.5) return false;
+      }
+      return true;
+    }
+
+    function encodeWav(samples, sampleRate){
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(buffer);
+      function writeStr(offset, str){ for(let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i)); }
+      writeStr(0, 'RIFF'); view.setUint32(4, 36 + samples.length*2, true); writeStr(8, 'WAVE');
+      writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate*2, true);
+      view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+      writeStr(36, 'data'); view.setUint32(40, samples.length*2, true);
+      let offset = 44;
+      for(let i=0;i<samples.length;i++, offset+=2){
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buffer;
+    }
+
+    async function loadModel(){
       const { KokoroTTS } = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
-      const device = (navigator.gpu && !kokoroForceWasmFlag) ? 'webgpu' : 'wasm';
+      const device = (self.navigator.gpu && !forceWasm) ? 'webgpu' : 'wasm';
       // Kokoro's own docs warn that pairing WebGPU with the 8-bit quantized
       // model produces garbled/distorted audio — fp32 is required on WebGPU.
       // The smaller q8 model is fine (and faster) on the WASM fallback path.
       const dtype = (device === 'webgpu') ? 'fp32' : 'q8';
-      kokoroHint.textContent = 'Loading voice model (' + (dtype === 'fp32' ? '~326MB, WebGPU' : '~86MB, WASM') + ')… this can take a bit the first time.';
-      kokoroTTS = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', { dtype, device });
+      tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', { dtype, device });
+    }
+
+    async function generateOnce(text, voice, isRetry){
+      const audio = await tts.generate(text, { voice });
+      if(audio.audio && audio.audio.length && !isSaneAudio(audio.audio)){
+        if(!isRetry && !forceWasm){
+          forceWasm = true;
+          tts = null;
+          await loadModel();
+          return generateOnce(text, voice, true);
+        }
+        throw new Error('Kokoro produced invalid audio even in compatibility mode');
+      }
+      if(typeof audio.toWav === 'function') return audio.toWav();
+      return encodeWav(audio.audio, audio.sampling_rate);
+    }
+
+    self.onmessage = async (e) => {
+      const { type, text, voice } = e.data;
+      try{
+        if(type === 'load'){
+          if(!tts) await loadModel();
+          self.postMessage({ type: 'loaded' });
+        }else if(type === 'generate'){
+          if(!tts) await loadModel();
+          const wavBuffer = await generateOnce(text, voice, false);
+          self.postMessage({ type: 'result', wavBuffer }, [wavBuffer]);
+        }
+      }catch(err){
+        self.postMessage({ type: 'error', message: (err && err.message) || String(err) });
+      }
+    };
+  `;
+
+  function getKokoroWorker(){
+    if(kokoroWorker) return kokoroWorker;
+    const blob = new Blob([KOKORO_WORKER_SOURCE], { type: 'application/javascript' });
+    kokoroWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+    kokoroWorker.onmessage = (e) => {
+      if(!kokoroPending) return;
+      const pending = kokoroPending;
+      kokoroPending = null;
+      if(e.data.type === 'loaded') pending.resolve();
+      else if(e.data.type === 'result') pending.resolve(e.data.wavBuffer);
+      else if(e.data.type === 'error') pending.reject(new Error(e.data.message));
+    };
+    kokoroWorker.onerror = (e) => {
+      if(kokoroPending){
+        const pending = kokoroPending;
+        kokoroPending = null;
+        pending.reject(new Error(e.message || 'Worker error'));
+      }
+    };
+    return kokoroWorker;
+  }
+
+  function callKokoroWorker(message){
+    return new Promise((resolve, reject) => {
+      kokoroPending = { resolve, reject };
+      getKokoroWorker().postMessage(message);
+    });
+  }
+
+  async function loadKokoroModel(){
+    if(kokoroTTS) return true;
+    if(kokoroLoading) return null;
+    kokoroLoading = true;
+    kokoroLoadBtn.disabled = true;
+    kokoroHint.textContent = 'Loading voice model… this can take a bit the first time, but the page stays responsive.';
+    try{
+      await callKokoroWorker({ type: 'load' });
+      kokoroTTS = true;
       kokoroHint.textContent = 'Model loaded — pick a voice and preview it.';
       kokoroVoiceSelect.disabled = false;
       kokoroPreviewBtn.disabled = false;
@@ -867,60 +968,16 @@
 
   kokoroLoadBtn.addEventListener('click', () => {
     kokoroTTS = null; // allow an explicit reload
+    if(kokoroWorker){ kokoroWorker.terminate(); kokoroWorker = null; }
     loadKokoroModel();
   });
 
-  // Encodes raw float32 PCM samples into a playable WAV Blob.
-  function encodeWav(samples, sampleRate){
-    const buffer = new ArrayBuffer(44 + samples.length * 2);
-    const view = new DataView(buffer);
-    function writeStr(offset, str){ for(let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i)); }
-    writeStr(0, 'RIFF'); view.setUint32(4, 36 + samples.length*2, true); writeStr(8, 'WAVE');
-    writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate*2, true);
-    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
-    writeStr(36, 'data'); view.setUint32(40, samples.length*2, true);
-    let offset = 44;
-    for(let i=0;i<samples.length;i++, offset+=2){
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    }
-    return new Blob([buffer], { type: 'audio/wav' });
-  }
-
-  // Valid PCM audio should stay roughly within [-1, 1]. If the model's raw
-  // output is wildly outside that (seen in practice: values into the tens),
-  // that's a sign the execution backend produced numerically corrupted
-  // output — not a fixable encoding issue, just a broken run that needs redoing.
-  function isSaneAudio(samples){
-    for(let i=0;i<samples.length;i++){
-      if(Math.abs(samples[i]) > 2.5) return false;
-    }
-    return true;
-  }
-
-  async function generateKokoroAudio(text, isRetry){
-    const tts = await loadKokoroModel();
-    if(!tts) throw new Error('Kokoro model isn\'t loaded');
+  async function generateKokoroAudio(text){
+    const ready = await loadKokoroModel();
+    if(!ready) throw new Error('Kokoro model isn\'t loaded');
     const voiceId = kokoroVoiceSelect.value || 'af_heart';
-    const audio = await tts.generate(text, { voice: voiceId });
-
-    if(audio.audio && audio.audio.length && !isSaneAudio(audio.audio)){
-      // Corrupted output — most often a WebGPU execution-backend bug on this
-      // device. Force the WASM path once and regenerate before giving up.
-      if(!isRetry && !kokoroForceWasmFlag){
-        console.warn('[Kokoro] output out of valid range — falling back to compatibility (WASM) mode and retrying.');
-        kokoroForceWasmFlag = true;
-        kokoroTTS = null;
-        kokoroHint.textContent = 'WebGPU produced corrupted audio on this device — switching to compatibility mode…';
-        await loadKokoroModel();
-        return generateKokoroAudio(text, true);
-      }
-      throw new Error('Kokoro produced invalid audio even in compatibility mode');
-    }
-
-    if(typeof audio.toBlob === 'function') return audio.toBlob();
-    return encodeWav(audio.audio, audio.sampling_rate);
+    const wavBuffer = await callKokoroWorker({ type: 'generate', text, voice: voiceId });
+    return new Blob([wavBuffer], { type: 'audio/wav' });
   }
 
   kokoroPreviewBtn.addEventListener('click', async () => {
@@ -931,9 +988,7 @@
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.play();
-      kokoroHint.textContent = kokoroForceWasmFlag
-        ? 'Model loaded (compatibility mode) — sounding good? Continue when ready.'
-        : 'Model loaded — pick a voice and preview it.';
+      kokoroHint.textContent = 'Model loaded — pick a voice and preview it.';
     }catch(err){
       kokoroHint.textContent = 'Preview failed: ' + (err && err.message ? err.message : 'unknown error');
     }
