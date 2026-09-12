@@ -512,7 +512,7 @@
 
       <div class="voice-field hidden" id="kokoroSection">
         <label for="kokoroVoiceSelect">Kokoro voice</label>
-        <p class="voice-hint" style="margin:0 0 10px;">Runs entirely in your browser — no account, no key, no usage limit. The voice model downloads once and is cached, but that first load can take a while.</p>
+        <p class="voice-hint" style="margin:0 0 10px;">Runs entirely in your browser — no account, no key, no usage limit. The voice model downloads once and is cached, but that first load can take a while. All six questions are narrated up front when you click Continue, so there's no wait once the interview starts.</p>
         <div class="voice-row">
           <button class="btn secondary" id="kokoroLoadBtn" type="button">Load voice model</button>
         </div>
@@ -817,9 +817,27 @@
       el.classList.toggle('hidden', !recorded);
     });
   }
-  modeTts.addEventListener('change', () => { narrationMode = 'tts'; applyNarrationModeUI(); });
-  modeRecorded.addEventListener('change', () => { narrationMode = 'recorded'; applyNarrationModeUI(); });
-  modeKokoro.addEventListener('change', () => { narrationMode = 'kokoro'; applyNarrationModeUI(); });
+
+  // narrationBlobs/narrationUrls hold per-question audio for BOTH "recorded"
+  // and "kokoro" modes (never both at once) — clear them whenever the mode
+  // changes so stale clips from one mode can't be mistaken for the other's.
+  function resetNarrationArtifacts(){
+    narrationUrls.forEach(u => { if(u) URL.revokeObjectURL(u); });
+    narrationBlobs = new Array(NUM_STATIONS).fill(null);
+    narrationUrls = new Array(NUM_STATIONS).fill(null);
+    for(let i=0;i<NUM_STATIONS;i++){
+      const status = document.getElementById('recStatus-'+i);
+      if(status){ status.textContent = 'Not recorded'; status.classList.remove('ok'); }
+      const preview = document.getElementById('recPreview-'+i);
+      if(preview){ preview.removeAttribute('src'); preview.classList.add('hidden'); }
+      const btn = document.querySelector('.rec-toggle-btn[data-idx="'+i+'"]');
+      if(btn){ btn.textContent = 'Record narration'; btn.classList.remove('recording'); }
+    }
+  }
+
+  modeTts.addEventListener('change', () => { narrationMode = 'tts'; resetNarrationArtifacts(); applyNarrationModeUI(); });
+  modeRecorded.addEventListener('change', () => { narrationMode = 'recorded'; resetNarrationArtifacts(); applyNarrationModeUI(); });
+  modeKokoro.addEventListener('change', () => { narrationMode = 'kokoro'; resetNarrationArtifacts(); applyNarrationModeUI(); });
 
   // ---- Kokoro (local, in-browser neural TTS) ----
   // Runs 100% client-side via kokoro-js (Kokoro-82M model), no account or key needed.
@@ -981,7 +999,7 @@
     toggleQuestionRecording(idx, btn);
   });
 
-  toPermissionBtn.addEventListener('click', () => {
+  toPermissionBtn.addEventListener('click', async () => {
     const values = [];
     for(let i=0;i<NUM_STATIONS;i++){
       values.push(document.getElementById('prompt-'+i).value.trim());
@@ -1001,10 +1019,32 @@
       // Free the setup mic now — the main permission step opens its own stream.
       if(setupMicStream){ setupMicStream.getTracks().forEach(t => t.stop()); setupMicStream = null; }
     }
-    if(narrationMode === 'kokoro' && !kokoroTTS){
-      kokoroHint.textContent = 'Load the voice model before continuing.';
-      kokoroSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      return;
+    if(narrationMode === 'kokoro'){
+      if(!kokoroTTS){
+        kokoroHint.textContent = 'Load the voice model before continuing.';
+        kokoroSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+      // Generate all six clips now, up front, so the interview itself has
+      // zero narration wait — this is the slow part, better spent here.
+      toPermissionBtn.disabled = true;
+      for(let i=0;i<NUM_STATIONS;i++){
+        toPermissionBtn.textContent = 'Generating narration ' + (i+1) + ' of ' + NUM_STATIONS + '…';
+        try{
+          const blob = await generateKokoroAudio(values[i]);
+          if(narrationUrls[i]) URL.revokeObjectURL(narrationUrls[i]);
+          const url = URL.createObjectURL(blob);
+          narrationBlobs[i] = blob;
+          narrationUrls[i] = url;
+        }catch(err){
+          // Leave this one unset — it'll fall back to generating live
+          // during the interview if the pre-generation attempt failed.
+          narrationBlobs[i] = null;
+          narrationUrls[i] = null;
+        }
+      }
+      toPermissionBtn.textContent = 'Continue';
+      toPermissionBtn.disabled = false;
     }
     prompts = values;
     showScreen('permission');
@@ -1063,9 +1103,11 @@
     captionBar.classList.remove('hidden');
     narrationVisual.classList.remove('idle');
 
-    if(narrationMode === 'recorded' && narrationUrls[currentIndex]){
+    if((narrationMode === 'recorded' || narrationMode === 'kokoro') && narrationUrls[currentIndex]){
+      // Already generated/recorded ahead of time — instant, no wait.
       playRecordedNarration(currentIndex, () => startRecording());
     }else if(narrationMode === 'kokoro'){
+      // Pre-generation must have failed for this one — fall back to live.
       statusLine.textContent = 'Generating narration…';
       try{
         const blob = await generateKokoroAudio(prompts[currentIndex]);
@@ -1219,10 +1261,8 @@
     mediaRecorder = null;
     recordedChunks = [];
 
-    // Reset any recorded narration clips too.
-    narrationUrls.forEach(u => { if(u) URL.revokeObjectURL(u); });
-    narrationBlobs = new Array(NUM_STATIONS).fill(null);
-    narrationUrls = new Array(NUM_STATIONS).fill(null);
+    // Reset any recorded/generated narration clips too.
+    resetNarrationArtifacts();
     if(setupMicStream){ setupMicStream.getTracks().forEach(t => t.stop()); setupMicStream = null; }
     narrationMode = 'tts';
     modeTts.checked = true;
@@ -1231,12 +1271,6 @@
     for(let i=0;i<NUM_STATIONS;i++){
       const field = document.getElementById('prompt-'+i);
       if(field) field.value = '';
-      const status = document.getElementById('recStatus-'+i);
-      if(status){ status.textContent = 'Not recorded'; status.classList.remove('ok'); }
-      const preview = document.getElementById('recPreview-'+i);
-      if(preview){ preview.removeAttribute('src'); preview.classList.add('hidden'); }
-      const btn = document.querySelector('.rec-toggle-btn[data-idx="'+i+'"]');
-      if(btn){ btn.textContent = 'Record narration'; btn.classList.remove('recording'); }
     }
     showScreen('setup');
     document.getElementById('prompt-0').focus();
