@@ -516,10 +516,6 @@
         <div class="voice-row">
           <button class="btn secondary" id="kokoroLoadBtn" type="button">Load voice model</button>
         </div>
-        <label class="mode-option" style="margin-top:10px; font-size:13px;">
-          <input type="checkbox" id="kokoroForceWasm">
-          Force compatibility mode (slower, but fixes garbled audio on some devices)
-        </label>
         <div class="voice-row" style="margin-top:14px;">
           <select id="kokoroVoiceSelect" disabled>
             <option value="af_heart">Heart — American, female</option>
@@ -655,7 +651,7 @@
   const kokoroVoiceSelect = document.getElementById('kokoroVoiceSelect');
   const kokoroPreviewBtn = document.getElementById('kokoroPreviewBtn');
   const kokoroHint = document.getElementById('kokoroHint');
-  const kokoroForceWasm = document.getElementById('kokoroForceWasm');
+  let kokoroForceWasmFlag = false; // set automatically when WebGPU output is detected as corrupted
   const voiceSelect = document.getElementById('voiceSelect');
   const previewVoiceBtn = document.getElementById('previewVoiceBtn');
   const voiceHint = document.getElementById('voiceHint');
@@ -849,7 +845,7 @@
     kokoroHint.textContent = 'Loading voice model… this can take 10–20 seconds the first time.';
     try{
       const { KokoroTTS } = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
-      const device = (navigator.gpu && !kokoroForceWasm.checked) ? 'webgpu' : 'wasm';
+      const device = (navigator.gpu && !kokoroForceWasmFlag) ? 'webgpu' : 'wasm';
       // Kokoro's own docs warn that pairing WebGPU with the 8-bit quantized
       // model produces garbled/distorted audio — fp32 is required on WebGPU.
       // The smaller q8 model is fine (and faster) on the WASM fallback path.
@@ -870,7 +866,7 @@
   }
 
   kokoroLoadBtn.addEventListener('click', () => {
-    kokoroTTS = null; // allow an explicit reload (e.g. after toggling compatibility mode)
+    kokoroTTS = null; // allow an explicit reload
     loadKokoroModel();
   });
 
@@ -912,9 +908,9 @@
     if(audio.audio && audio.audio.length && !isSaneAudio(audio.audio)){
       // Corrupted output — most often a WebGPU execution-backend bug on this
       // device. Force the WASM path once and regenerate before giving up.
-      if(!isRetry && !kokoroForceWasm.checked){
+      if(!isRetry && !kokoroForceWasmFlag){
         console.warn('[Kokoro] output out of valid range — falling back to compatibility (WASM) mode and retrying.');
-        kokoroForceWasm.checked = true;
+        kokoroForceWasmFlag = true;
         kokoroTTS = null;
         kokoroHint.textContent = 'WebGPU produced corrupted audio on this device — switching to compatibility mode…';
         await loadKokoroModel();
@@ -935,7 +931,7 @@
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.play();
-      kokoroHint.textContent = kokoroForceWasm.checked
+      kokoroHint.textContent = kokoroForceWasmFlag
         ? 'Model loaded (compatibility mode) — sounding good? Continue when ready.'
         : 'Model loaded — pick a voice and preview it.';
     }catch(err){
