@@ -874,26 +874,35 @@
     return new Blob([buffer], { type: 'audio/wav' });
   }
 
-  async function generateKokoroAudio(text){
+  // Valid PCM audio should stay roughly within [-1, 1]. If the model's raw
+  // output is wildly outside that (seen in practice: values into the tens),
+  // that's a sign the execution backend produced numerically corrupted
+  // output — not a fixable encoding issue, just a broken run that needs redoing.
+  function isSaneAudio(samples){
+    for(let i=0;i<samples.length;i++){
+      if(Math.abs(samples[i]) > 2.5) return false;
+    }
+    return true;
+  }
+
+  async function generateKokoroAudio(text, isRetry){
     const tts = await loadKokoroModel();
     if(!tts) throw new Error('Kokoro model isn\'t loaded');
     const voiceId = kokoroVoiceSelect.value || 'af_heart';
     const audio = await tts.generate(text, { voice: voiceId });
 
-    // Diagnostic logging — safe to leave in, only visible in the console.
-    console.log('[Kokoro debug] raw output object:', audio);
-    console.log('[Kokoro debug] has toBlob():', typeof audio.toBlob === 'function');
-    console.log('[Kokoro debug] has toWav():', typeof audio.toWav === 'function');
-    console.log('[Kokoro debug] sampling_rate:', audio.sampling_rate);
-    console.log('[Kokoro debug] audio field type:', audio.audio ? audio.audio.constructor.name : typeof audio.audio);
-    console.log('[Kokoro debug] audio length (samples):', audio.audio ? audio.audio.length : 'n/a');
-    if(audio.audio && audio.audio.length){
-      let min = Infinity, max = -Infinity;
-      for(let i=0;i<audio.audio.length;i++){
-        if(audio.audio[i] < min) min = audio.audio[i];
-        if(audio.audio[i] > max) max = audio.audio[i];
+    if(audio.audio && audio.audio.length && !isSaneAudio(audio.audio)){
+      // Corrupted output — most often a WebGPU execution-backend bug on this
+      // device. Force the WASM path once and regenerate before giving up.
+      if(!isRetry && !kokoroForceWasm.checked){
+        console.warn('[Kokoro] output out of valid range — falling back to compatibility (WASM) mode and retrying.');
+        kokoroForceWasm.checked = true;
+        kokoroTTS = null;
+        kokoroHint.textContent = 'WebGPU produced corrupted audio on this device — switching to compatibility mode…';
+        await loadKokoroModel();
+        return generateKokoroAudio(text, true);
       }
-      console.log('[Kokoro debug] sample value range: min=' + min + ' max=' + max);
+      throw new Error('Kokoro produced invalid audio even in compatibility mode');
     }
 
     if(typeof audio.toBlob === 'function') return audio.toBlob();
@@ -908,7 +917,9 @@
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.play();
-      kokoroHint.textContent = 'Model loaded — pick a voice and preview it.';
+      kokoroHint.textContent = kokoroForceWasm.checked
+        ? 'Model loaded (compatibility mode) — sounding good? Continue when ready.'
+        : 'Model loaded — pick a voice and preview it.';
     }catch(err){
       kokoroHint.textContent = 'Preview failed: ' + (err && err.message ? err.message : 'unknown error');
     }
